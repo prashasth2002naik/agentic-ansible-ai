@@ -56,3 +56,18 @@ Install:
 pip install -r requirements.txt
 
 
+step 5 - run code
+cd agentic-ansible-ai
+uvicorn api.main:app --reload
+# after running the above command you have to open a new terminal in the cloned repo and run the below command
+curl -X POST http://127.0.0.1:8000/request-task \task \
+-H "Content-Type: application/json" \
+-d '{
+  "text": "Ensure the git package is installed using apt on Ubuntu host 172.18.181.135",
+  "credentials": {
+    "ssh_user": "msis",
+    "password": "university"
+  }
+}'
+
+# text in the above command is you prompt make sure the prompt is very clear and meaningful along with the desired ip's you would like the desired changes to be reflected on and ensure to enter the correct ssh user and password 
