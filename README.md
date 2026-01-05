@@ -51,6 +51,16 @@ ansible-runner
 requests
 
 
+-- set up python virtual environment
+sudo apt install python3-full python3-venv
+
+
+python3 -m venv venv
+
+
+source venv/bin/activate
+
+
 Install:
 
 pip install -r requirements.txt
