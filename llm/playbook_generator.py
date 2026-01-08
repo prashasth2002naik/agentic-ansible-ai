@@ -3,157 +3,195 @@ import re
 import yaml
 from llm.llm_client import query_llm
 
-# Base paths
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PLAYBOOK_DIR = os.path.join(BASE_DIR, "generated", "playbooks")
-os.makedirs(PLAYBOOK_DIR, exist_ok=True)
+PLAYBOOK_DIR = "generated/playbooks"
+PLAYBOOK_PATH = os.path.join(PLAYBOOK_DIR, "generated.yml")
+MAX_ATTEMPTS = 6
 
+# -------------------------------
+# Normalize meta-packages
+# -------------------------------
+PACKAGE_EXPANSIONS = {
+    "php": ["php-cli", "php-common", "libapache2-mod-php"],
+}
 
-def clean_llm_output(text: str) -> str:
-    """
-    Remove markdown fences and extra text from LLM output
-    """
-    text = re.sub(r"```[a-zA-Z]*", "", text)
-    text = re.sub(r"```", "", text)
+# -------------------------------
+def strip_code_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("```", 1)[1]
+    if text.endswith("```"):
+        text = text.rsplit("```", 1)[0]
     return text.strip()
 
-
-def normalize_tasks(data):
-    """
-    Normalize different LLM output shapes into a pure task list
-    """
-    # Case 1: LLM returned list of tasks
-    if isinstance(data, list):
-        # If list of plays, extract tasks
-        if data and isinstance(data[0], dict) and "tasks" in data[0]:
-            return normalize_tasks(data[0]["tasks"])
-        return data
-
-    # Case 2: dict with "tasks"
-    if isinstance(data, dict) and "tasks" in data:
-        return normalize_tasks(data["tasks"])
-
+# -------------------------------
+def detect_module(task: dict):
+    for m in ("apt", "service", "systemd"):
+        if m in task:
+            return m
     return None
 
+# -------------------------------
+def normalize_apt_name(name):
+    if not isinstance(name, str):
+        return name
+    base = re.sub(r"[0-9].*$", "", name).rstrip("-")
+    return PACKAGE_EXPANSIONS.get(base, name)
 
-def sanitize_task(task: dict) -> dict:
+# -------------------------------
+def unwrap_task(task):
     """
-    Sanitize a single Ansible task produced by an LLM.
-    Enforces module schemas and removes hallucinated keys.
+    Converts:
+    - task: { name: X, apt: {...} }
+    into:
+    { name: X, apt: {...} }
     """
+    if "task" in task and isinstance(task["task"], dict):
+        return task["task"]
+    return task
 
-    # ---- REMOVE LOOPING (LLMs hallucinate loops often) ----
-    task.pop("with_items", None)
-    task.pop("loop", None)
-    task.pop("loop_control", None)
+# -------------------------------
+def sanitize_task(task):
+    if not isinstance(task, dict):
+        return None
 
-    # ---- APT MODULE ----
-    if "apt" in task:
-        apt = task["apt"]
+    task = unwrap_task(task)
 
-        # Map common aliases
+    # Remove play-level keys
+    for bad in ("hosts", "become", "tasks"):
+        task.pop(bad, None)
+
+    if "name" in task:
+        task["name"] = re.sub(r"on .*", "", task["name"]).strip()
+
+    task.pop("when", None)
+    task.pop("register", None)
+
+    module = detect_module(task)
+    if not module:
+        return None
+
+    # ---------------- APT ----------------
+    if module == "apt":
+        apt = task.get("apt")
+        if not isinstance(apt, dict):
+            return None
+
         if "pkg" in apt:
             apt["name"] = apt.pop("pkg")
         if "package" in apt:
             apt["name"] = apt.pop("package")
-        if "args" in apt:
-            apt["name"] = apt.pop("args")
 
-        # Keep only valid apt parameters
-        allowed_keys = {
-            "name",
-            "state",
-            "update_cache",
-            "cache_valid_time",
-            "force",
-            "default_release",
+        names = apt.get("name")
+        if not names:
+            return None
+
+        if not isinstance(names, list):
+            names = [names]
+
+        expanded = []
+        for n in names:
+            norm = normalize_apt_name(n)
+            if isinstance(norm, list):
+                expanded.extend(norm)
+            else:
+                expanded.append(norm)
+
+        apt["name"] = sorted(set(expanded))
+        apt["state"] = apt.get("state", "present")
+        apt["update_cache"] = apt.get("update_cache", True)
+
+        allowed = {
+            "name", "state", "update_cache",
+            "cache_valid_time", "force",
             "install_recommends",
             "allow_unauthenticated"
         }
 
-        for key in list(apt.keys()):
-            if key not in allowed_keys:
-                apt.pop(key)
+        for k in list(apt.keys()):
+            if k not in allowed:
+                apt.pop(k)
 
-        apt.setdefault("state", "present")
+    # ---------------- SERVICE / SYSTEMD ----------------
+    if module in ("service", "systemd"):
+        svc = task.get(module)
+        if not isinstance(svc, dict):
+            return None
 
-    # ---- SERVICE / SYSTEMD MODULE ----
-    # ---- SERVICE / SYSTEMD MODULE ----
-    for module in ("service", "systemd"):
-        if module in task:
-            svc = task[module]
+        svc["name"] = svc.get("name", "").split(".")[0]
+        svc["state"] = svc.get("state", "started")
+        svc.setdefault("enabled", True)
 
-            # Remove hallucinated host-related keys
-            for bad_key in ("host", "hosts", "target", "ip"):
-                svc.pop(bad_key, None)
-
-            # Clean service name (remove host text like ": host", "on <ip>")
-            if "name" in svc:
-                svc["name"] = svc["name"].split(":")[0]
-                svc["name"] = svc["name"].split(" on ")[0]
-                svc["name"] = svc["name"].strip()
-
-            # Remove fake services like git
-            if svc.get("name") in {"git"}:
-                task.pop(module)
-            else:
-                svc.setdefault("state", "started")
+        for bad in ("host", "target", "ip"):
+            svc.pop(bad, None)
 
     return task
 
-
+# -------------------------------
 def generate_playbook(intent: str):
-    """
-    Generate a valid Ansible playbook using ONLY LLM output,
-    normalized and sanitized before execution.
-    """
+    feedback = ""
 
-    prompt = f"""
-You are an Ansible task generator.
+    base_prompt = f"""
+You are an Ansible automation engine.
 
 Rules:
 - Output ONLY valid YAML
-- Output ONLY Ansible TASKS
-- DO NOT include hosts, become, vars, or play definitions
-- DO NOT include explanations or markdown
-- Use apt and service/systemd modules where appropriate
-- Target OS is Ubuntu
-
-If the task cannot be expressed as Ansible tasks, return an empty list: []
+- Output a LIST of Ansible TASKS only
+- NO markdown
+- NO explanations
+- NO hosts, become, vars
+- Use ONLY: apt, service, systemd
+- Use Ubuntu service names
 
 User request:
-"{intent}"
+{intent}
 """
 
-    # Call LLM
-    response = query_llm(prompt)
-    cleaned = clean_llm_output(response)
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        print(f">>> LLM CALL ATTEMPT {attempt} <<<")
 
-    try:
-        raw = yaml.safe_load(cleaned)
-    except Exception:
-        return None
+        prompt = base_prompt
+        if feedback:
+            prompt += f"\n\nPrevious error:\n{feedback}"
 
-    tasks = normalize_tasks(raw)
-    if not tasks:
-        return None
+        response = strip_code_fences(query_llm(prompt))
 
-    # Sanitize all tasks
-    tasks = [sanitize_task(task) for task in tasks if isinstance(task, dict)]
+        print("\n=== RAW LLM OUTPUT ===")
+        print(response)
+        print("======================")
 
-    if not tasks:
-        return None
+        try:
+            parsed = yaml.safe_load(response)
+        except Exception as e:
+            feedback = f"YAML parse error: {e}"
+            continue
 
-    # Build final playbook
-    playbook = [{
-        "name": "LLM Generated Automation",
-        "hosts": "all",
-        "become": True,
-        "tasks": tasks
-    }]
+        if not isinstance(parsed, list):
+            feedback = "Output must be a list of tasks"
+            continue
 
-    playbook_path = os.path.join(PLAYBOOK_DIR, "generated.yml")
-    with open(playbook_path, "w") as f:
-        yaml.dump(playbook, f, default_flow_style=False)
+        sanitized = []
+        for t in parsed:
+            clean = sanitize_task(t)
+            if clean:
+                sanitized.append(clean)
 
-    return playbook_path
+        if not sanitized:
+            feedback = "All tasks dropped during sanitization"
+            continue
+
+        playbook = [{
+            "name": "LLM Generated Automation",
+            "hosts": "all",
+            "become": True,
+            "tasks": sanitized
+        }]
+
+        os.makedirs(PLAYBOOK_DIR, exist_ok=True)
+        with open(PLAYBOOK_PATH, "w") as f:
+            yaml.safe_dump(playbook, f, sort_keys=False)
+
+        print("✅ PLAYBOOK GENERATED SUCCESSFULLY")
+        print(f"📄 {PLAYBOOK_PATH}")
+        return PLAYBOOK_PATH
+
+    return None
